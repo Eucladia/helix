@@ -94,12 +94,12 @@ fn find_nth_closest_pairs_plain(
 ) -> Result<(usize, usize)> {
     let mut stack = Vec::with_capacity(2);
     let pos = range.from();
-    let mut close_pos = pos.saturating_sub(1);
 
-    for ch in text.chars_at(pos) {
-        close_pos += 1;
+    for (offset, ch) in text.chars_at(pos).enumerate() {
+        let close_pos = pos + offset;
 
-        if is_open_bracket(ch) {
+        // If cursor is on opening bracket, don't skip its resulting pair.
+        if is_open_bracket(ch) && offset != 0 {
             // Track open pairs encountered so that we can step over
             // the corresponding close pairs that will come up further
             // down the loop. We want to find a lone close pair whose
