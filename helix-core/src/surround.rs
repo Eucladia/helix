@@ -161,7 +161,6 @@ pub fn find_nth_pairs_pos(
     ch: char,
     range: Range,
     n: usize,
-    syntax: Option<&Syntax>,
 ) -> Result<(usize, usize)> {
     if text.len_chars() < 2 {
         return Err(Error::PairNotFound);
@@ -407,11 +406,7 @@ mod test {
 
         assert_eq!(2, expectations.len());
         assert_eq!(
-<<<<<<< HEAD
-            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 1, None)
-=======
             find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 1)
->>>>>>> master
                 .expect("find should succeed"),
             (expectations[0], expectations[1])
         )
@@ -428,11 +423,7 @@ mod test {
 
         assert_eq!(2, expectations.len());
         assert_eq!(
-<<<<<<< HEAD
-            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 2, None)
-=======
             find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 2)
->>>>>>> master
                 .expect("find should succeed"),
             (expectations[0], expectations[1])
         )
@@ -448,11 +439,7 @@ mod test {
             );
 
         assert_eq!(
-<<<<<<< HEAD
-            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 1, None),
-=======
             find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 1),
->>>>>>> master
             Err(Error::CursorOnAmbiguousPair)
         )
     }
