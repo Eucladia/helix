@@ -60,6 +60,7 @@ fn find_nth_closest_pairs_ts(
     let mut closing = range.to() - 1;
 
     while skip > 0 {
+        let start = closing;
         closing = find_matching_bracket_fuzzy(syntax, text, closing).ok_or(Error::PairNotFound)?;
         opening = find_matching_bracket(syntax, text, closing).ok_or(Error::PairNotFound)?;
         // If we're already on a closing bracket "find_matching_bracket_fuzzy" will return
@@ -76,6 +77,12 @@ fn find_nth_closest_pairs_ts(
             if skip != 0 {
                 closing = next_grapheme_boundary(text, closing);
             }
+        }
+
+        // A matched pair can lie before the search position, so stop when the search doesn't
+        // move forward, or this loops forever.
+        if skip != 0 && closing <= start {
+            return Err(Error::PairNotFound);
         }
     }
 
@@ -95,11 +102,9 @@ fn find_nth_closest_pairs_plain(
     let mut stack = Vec::with_capacity(2);
     let pos = range.from();
 
-    for (offset, ch) in text.chars_at(pos).enumerate() {
-        let close_pos = pos + offset;
-
+    for (close_pos, ch) in (pos..).zip(text.chars_at(pos)) {
         // If cursor is on opening bracket, don't skip its resulting pair.
-        if is_open_bracket(ch) && offset != 0 {
+        if is_open_bracket(ch) && close_pos != pos {
             // Track open pairs encountered so that we can step over
             // the corresponding close pairs that will come up further
             // down the loop. We want to find a lone close pair whose
@@ -228,11 +233,13 @@ fn find_nth_open_pair(
     // Adjusts pos for the first iteration, and handles the case of the
     // cursor being *on* the close character which will get falsely stepped over
     // if not skipped here
-    if chars.prev()? == open {
-        return Some(pos);
-    }
+    let count = if chars.prev()? == open {
+        n.saturating_sub(1)
+    } else {
+        n
+    };
 
-    for _ in 0..n {
+    for _ in 0..count {
         let mut step_over: usize = 0;
 
         loop {
@@ -268,11 +275,13 @@ fn find_nth_close_pair(
 
     let mut chars = text.chars_at(pos);
 
-    if chars.next()? == close {
-        return Some(pos);
-    }
+    let count = if chars.next()? == close {
+        n.saturating_sub(1)
+    } else {
+        n
+    };
 
-    for _ in 0..n {
+    for _ in 0..count {
         let mut step_over: usize = 0;
 
         loop {
@@ -396,6 +405,18 @@ mod test {
     }
 
     #[test]
+    fn test_find_nth_pairs_pos_counted_from_delimiter() {
+        let doc = Rope::from("((x))\n");
+        for pos in 1..=3 {
+            assert_eq!(
+                find_nth_pairs_pos(None, doc.slice(..), '(', Range::new(pos, pos + 1), 2),
+                Ok((0, 4)),
+                "cursor at {pos}"
+            );
+        }
+    }
+
+    #[test]
     fn test_find_nth_pairs_pos_quote_success() {
         #[rustfmt::skip]
         let (doc, selection, expectations) =
@@ -445,7 +466,7 @@ mod test {
     }
 
     #[test]
-    fn test_find_nth_closest_pairs_pos_index_range_panic() {
+    fn test_find_nth_closest_pairs_pos_at_document_start() {
         #[rustfmt::skip]
         let (doc, selection, _) =
             rope_with_selections_and_expectations(
@@ -455,6 +476,15 @@ mod test {
 
         assert_eq!(
             find_nth_closest_pairs_pos(None, doc.slice(..), selection.primary(), 1),
+            Ok((0, 2))
+        )
+    }
+
+    #[test]
+    fn test_find_nth_closest_pairs_pos_stray_close_at_doc_start() {
+        let doc = Rope::from(")(\n");
+        assert_eq!(
+            find_nth_closest_pairs_pos(None, doc.slice(..), Range::new(0, 1), 1),
             Err(Error::PairNotFound)
         )
     }

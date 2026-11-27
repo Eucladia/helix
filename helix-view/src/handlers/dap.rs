@@ -40,9 +40,13 @@ pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: b
     }
 
     debugger.thread_id = Some(thread_id);
+    debugger.active_frame = Some(0);
     fetch_stack_trace(debugger, thread_id).await;
 
-    let frame = debugger.stack_frames[&thread_id].first().cloned();
+    let frame = debugger
+        .stack_frames
+        .get(&thread_id)
+        .and_then(|frames| frames.first().cloned());
     if let Some(frame) = &frame {
         jump_to_stack_frame(editor, frame);
     }
@@ -54,7 +58,6 @@ pub async fn fetch_stack_trace(debugger: &mut Client, thread_id: ThreadId) {
         Err(_) => return,
     };
     debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = Some(0);
 }
 
 pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
@@ -231,13 +234,6 @@ impl Editor {
                     }
                     Event::Thread(thread) => {
                         self.set_status(format!("Thread {}: {}", thread.thread_id, thread.reason));
-                        let debugger = match self.debug_adapters.get_client_mut(id) {
-                            Some(debugger) => debugger,
-                            None => return false,
-                        };
-
-                        debugger.thread_id = Some(thread.thread_id);
-                        // set the stack frame for the thread
                     }
                     Event::Breakpoint(events::BreakpointBody { reason, breakpoint }) => {
                         match &reason[..] {
@@ -331,6 +327,46 @@ impl Editor {
 
                         log::info!("{}", output);
                         self.set_status(format!("{} {}", prefix, output));
+                    }
+                    Event::ProgressStart(body) => {
+                        let status = {
+                            let debugger = match self.debug_adapters.get_client_mut(id) {
+                                Some(debugger) => debugger,
+                                None => return false,
+                            };
+
+                            debugger.progress_start(body)
+                        };
+
+                        self.set_status(status);
+                    }
+                    Event::ProgressUpdate(body) => {
+                        let status = {
+                            let debugger = match self.debug_adapters.get_client_mut(id) {
+                                Some(debugger) => debugger,
+                                None => return false,
+                            };
+
+                            debugger.progress_update(body)
+                        };
+
+                        if let Some(status) = status {
+                            self.set_status(status);
+                        }
+                    }
+                    Event::ProgressEnd(body) => {
+                        let status = {
+                            let debugger = match self.debug_adapters.get_client_mut(id) {
+                                Some(debugger) => debugger,
+                                None => return false,
+                            };
+
+                            debugger.progress_end(body)
+                        };
+
+                        if let Some(status) = status {
+                            self.set_status(status);
+                        }
                     }
                     Event::Initialized(_) => {
                         self.set_status("Debugger initialized...");
@@ -452,7 +488,7 @@ impl Editor {
 
                         let process = match std::process::Command::new(&config.command)
                             .args(&config.args)
-                            .arg(arguments.args.join(" "))
+                            .args(&arguments.args)
                             .spawn()
                         {
                             Ok(process) => process,

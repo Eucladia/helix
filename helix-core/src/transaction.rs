@@ -401,7 +401,11 @@ impl ChangeSet {
                         let Some((pos, assoc)) = positions.peek_mut() else {
                             return;
                         };
-                        if **pos < old_pos {
+                        // A pure insertion also owns its left boundary. Revisit it when a later
+                        // input position moves back to that boundary.
+                        let passed_insert =
+                            **pos == old_pos && $i > 0 && matches!(self.changes[$i - 1], Insert(_));
+                        if **pos < old_pos || passed_insert {
                             // Positions are not sorted, revert to the last Operation that
                             // contains this position and continue iterating from there.
                             // We can unwrap here since `pos` can not be negative
@@ -476,10 +480,9 @@ impl ChangeSet {
                                 if pos == old_pos && assoc.stay_at_gaps() {
                                     new_pos
                                 } else {
-                                    let ins = assoc.insert_offset(s);
                                     // if the deleted and inserted text have the exact same size
                                     // keep the relative offset into the new text
-                                    if *len == ins && assoc.sticky() {
+                                    if *len == s.chars().count() && assoc.sticky() {
                                         new_pos + (pos - old_pos)
                                     } else {
                                         new_pos + assoc.insert_offset(s)
@@ -522,6 +525,49 @@ impl ChangeSet {
 
     pub fn changes_iter(&self) -> ChangeIterator<'_> {
         ChangeIterator::new(self)
+    }
+
+    pub fn from_change(doc: &Rope, change: Change) -> Self {
+        Self::from_changes(doc, std::iter::once(change))
+    }
+
+    /// Generate a ChangeSet from a set of changes.
+    pub fn from_changes<I>(doc: &Rope, changes: I) -> Self
+    where
+        I: Iterator<Item = Change>,
+    {
+        let len = doc.len_chars();
+
+        let (lower, upper) = changes.size_hint();
+        let size = upper.unwrap_or(lower);
+        let mut changeset = ChangeSet::with_capacity(2 * size + 1); // rough estimate
+
+        let mut last = 0;
+        for (from, to, tendril) in changes {
+            // Verify ranges are ordered and not overlapping
+            debug_assert!(last <= from);
+            // Verify ranges are correct
+            debug_assert!(
+                from <= to,
+                "Edit end must end before it starts (should {from} <= {to})"
+            );
+
+            // Retain from last "to" to current "from"
+            changeset.retain(from - last);
+            let span = to - from;
+            match tendril {
+                Some(text) => {
+                    changeset.insert(text);
+                    changeset.delete(span);
+                }
+                None => changeset.delete(span),
+            }
+            last = to;
+        }
+
+        changeset.retain(len - last);
+
+        changeset
     }
 }
 
@@ -616,38 +662,7 @@ impl Transaction {
     where
         I: Iterator<Item = Change>,
     {
-        let len = doc.len_chars();
-
-        let (lower, upper) = changes.size_hint();
-        let size = upper.unwrap_or(lower);
-        let mut changeset = ChangeSet::with_capacity(2 * size + 1); // rough estimate
-
-        let mut last = 0;
-        for (from, to, tendril) in changes {
-            // Verify ranges are ordered and not overlapping
-            debug_assert!(last <= from);
-            // Verify ranges are correct
-            debug_assert!(
-                from <= to,
-                "Edit end must end before it starts (should {from} <= {to})"
-            );
-
-            // Retain from last "to" to current "from"
-            changeset.retain(from - last);
-            let span = to - from;
-            match tendril {
-                Some(text) => {
-                    changeset.insert(text);
-                    changeset.delete(span);
-                }
-                None => changeset.delete(span),
-            }
-            last = to;
-        }
-
-        changeset.retain(len - last);
-
-        Self::from(changeset)
+        Self::from(ChangeSet::from_changes(doc, changes))
     }
 
     /// Generate a transaction from a set of potentially overlapping deletions
@@ -710,12 +725,12 @@ impl Transaction {
         let process_change = |change_start, change_end, (idx, range): (usize, &Range)| {
             // update the primary idx
             if idx == selection.primary_index() {
-                new_primary_idx = Some(idx);
+                new_primary_idx = Some(ranges.len());
             } else if new_primary_idx.is_none() {
                 if idx > selection.primary_index() {
                     new_primary_idx = last_selection_idx;
                 } else {
-                    last_selection_idx = Some(idx);
+                    last_selection_idx = Some(ranges.len());
                 }
             }
             ranges.push(*range);
@@ -736,14 +751,118 @@ impl Transaction {
         )
     }
 
+    /// Generate a transaction with a change per selection range, which
+    /// generates a new selection as well. Each range is operated upon by
+    /// the given function and can optionally produce a new range. If none
+    /// is returned by the function, that range is mapped through the change
+    /// as usual.
+    pub fn change_by_and_with_selection<F>(doc: &Rope, selection: &Selection, mut f: F) -> Self
+    where
+        F: FnMut(&Range) -> (Change, Option<Range>),
+    {
+        let mut end_ranges = SmallVec::with_capacity(selection.len());
+        let mut offset = 0;
+
+        let transaction = Transaction::change_by_selection(doc, selection, |start_range| {
+            let ((from, to, replacement), end_range) = f(start_range);
+            let mut change_size = to as isize - from as isize;
+
+            if let Some(ref text) = replacement {
+                change_size = text.chars().count() as isize - change_size;
+            } else {
+                change_size = -change_size;
+            }
+
+            let new_range = if let Some(end_range) = end_range {
+                end_range
+            } else {
+                let changeset = ChangeSet::from_change(doc, (from, to, replacement.clone()));
+                start_range.map(&changeset)
+            };
+
+            let offset_range = Range::new(
+                (new_range.anchor as isize + offset) as usize,
+                (new_range.head as isize + offset) as usize,
+            );
+
+            end_ranges.push(offset_range);
+            offset += change_size;
+
+            log::trace!(
+                "from: {}, to: {}, replacement: {:?}, offset: {}",
+                from,
+                to,
+                replacement,
+                offset
+            );
+
+            (from, to, replacement)
+        });
+
+        transaction.with_selection(Selection::new(end_ranges, selection.primary_index()))
+    }
+
     /// Generate a transaction with a deletion per selection range.
     /// Compared to using `change_by_selection` directly these ranges may overlap.
-    /// In that case they are merged
+    /// In that case they are merged.
     pub fn delete_by_selection<F>(doc: &Rope, selection: &Selection, f: F) -> Self
     where
         F: FnMut(&Range) -> Deletion,
     {
         Self::delete(doc, selection.iter().map(f))
+    }
+
+    /// Generate a transaction with a delete per selection range, which
+    /// generates a new selection as well. Each range is operated upon by
+    /// the given function and can optionally produce a new range. If none
+    /// is returned by the function, that range is mapped through the change
+    /// as usual.
+    ///
+    /// Compared to using `change_by_and_with_selection` directly these ranges
+    /// may overlap. In that case they are merged.
+    pub fn delete_by_and_with_selection<F>(doc: &Rope, selection: &Selection, mut f: F) -> Self
+    where
+        F: FnMut(&Range) -> (Deletion, Option<Range>),
+    {
+        let mut end_ranges = SmallVec::with_capacity(selection.len());
+        let mut offset = 0;
+        let mut last = 0;
+
+        let transaction = Transaction::delete_by_selection(doc, selection, |start_range| {
+            let ((from, to), end_range) = f(start_range);
+
+            // must account for possibly overlapping deletes
+            let change_size = if last > from { to - last } else { to - from };
+
+            let new_range = if let Some(end_range) = end_range {
+                end_range
+            } else {
+                let changeset = ChangeSet::from_change(doc, (from, to, None));
+                start_range.map(&changeset)
+            };
+
+            let offset_range = Range::new(
+                new_range.anchor.saturating_sub(offset),
+                new_range.head.saturating_sub(offset),
+            );
+
+            log::trace!(
+                "delete from: {}, to: {}, offset: {}, new_range: {:?}, offset_range: {:?}",
+                from,
+                to,
+                offset,
+                new_range,
+                offset_range
+            );
+
+            end_ranges.push(offset_range);
+            offset += change_size;
+            last = to;
+
+            (from, to)
+        });
+
+        transaction.with_selection(Selection::new(end_ranges, selection.primary_index()))
     }
 
     /// Insert text at each selection head.
@@ -974,6 +1093,33 @@ mod test {
         };
         assert_eq!(cs.map_pos(2, Assoc::BeforeWord), 1);
         assert_eq!(cs.map_pos(4, Assoc::AfterWord), 4);
+    }
+
+    #[test]
+    fn unsorted_position_at_insert() {
+        let doc = Rope::from("0123456789");
+        let cs = ChangeSet::from_changes(&doc, [(5, 5, Some("X".into()))].into_iter());
+        let (mut outer_end, mut inner_end) = (7, 5);
+        cs.update_positions(
+            [
+                (&mut outer_end, Assoc::Before),
+                (&mut inner_end, Assoc::Before),
+            ]
+            .into_iter(),
+        );
+        assert_eq!((outer_end, inner_end), (8, 5));
+
+        // Same at an insert that ends the changeset.
+        let cs = ChangeSet::from_changes(&doc, [(10, 10, Some("X".into()))].into_iter());
+        let (mut outer_end, mut inner_end) = (10, 10);
+        cs.update_positions(
+            [
+                (&mut outer_end, Assoc::After),
+                (&mut inner_end, Assoc::Before),
+            ]
+            .into_iter(),
+        );
+        assert_eq!((outer_end, inner_end), (11, 10));
     }
 
     #[test]

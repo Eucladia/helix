@@ -121,15 +121,13 @@ async fn surround_by_character() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn surround_inside_pair() -> anyhow::Result<()> {
     // Works at first character of buffer
-    // TODO: Adjust test when opening pair failure is fixed
-    test(("#[(|]#something)", "mim", "#[(|]#something)")).await?;
+    test(("#[(|]#something)", "mim", "(#[something|]#)")).await?;
 
     // Inside a valid pair selects pair
     test(("some (#[t|]#ext) here", "mim", "some (#[text|]#) here")).await?;
 
     // On pair character selects pair
-    // TODO: Opening pair character is a known failure case that needs addressing
-    // test(("some #[(|]#text) here", "mim", "some (#[text|]#) here")).await?;
+    test(("some #[(|]#text) here", "mim", "some (#[text|]#) here")).await?;
     test(("some (text#[)|]# here", "mim", "some (#[text|]#) here")).await?;
 
     // No valid pair does nothing
@@ -249,15 +247,13 @@ async fn surround_inside_pair() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn surround_around_pair() -> anyhow::Result<()> {
     // Works at first character of buffer
-    // TODO: Adjust test when opening pair failure is fixed
-    test(("#[(|]#something)", "mam", "#[(|]#something)")).await?;
+    test(("#[(|]#something)", "mam", "#[(something)|]#")).await?;
 
     // Inside a valid pair selects pair
     test(("some (#[t|]#ext) here", "mam", "some #[(text)|]# here")).await?;
 
     // On pair character selects pair
-    // TODO: Opening pair character is a known failure case that needs addressing
-    // test(("some #[(|]#text) here", "mam", "some #[(text)|]# here")).await?;
+    test(("some #[(|]#text) here", "mam", "some #[(text)|]# here")).await?;
     test(("some (text#[)|]# here", "mam", "some #[(text)|]# here")).await?;
 
     // No valid pair does nothing
@@ -871,4 +867,55 @@ async fn tree_sitter_motions_work_across_injections() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_abort_after_async_edit() -> anyhow::Result<()> {
+    test_key_sequences(
+        &mut AppBuilder::new()
+            .with_input_text("one\ntwo #[x|]#\n")
+            .build()?,
+        vec![
+            (
+                Some("/"),
+                Some(&|_| {
+                    // Simulate a formatter changing the document while the search prompt is open.
+                    helix_term::job::dispatch_blocking(|editor, _| {
+                        let (view, doc) = helix_view::current!(editor);
+                        let transaction = helix_core::Transaction::change(
+                            doc.text(),
+                            std::iter::once((0, 4, None)),
+                        );
+                        doc.apply(&transaction, view.id);
+                        doc.append_changes_to_history(view);
+                    });
+                }),
+            ),
+            (None, None),
+            (
+                Some("<esc>"),
+                Some(&|app| {
+                    let (view, doc) = helix_view::current_ref!(app.editor);
+                    assert_eq!(doc.text(), "two x\n");
+                    assert_eq!(doc.selection(view.id), &Selection::single(4, 5));
+                }),
+            ),
+        ],
+        false,
+    )
+    .await
+}
+
+// After an edit, `A-i` must not restore an `A-o` history range from before the edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn shrink_selection_after_edit() -> anyhow::Result<()> {
+    test_with_config(
+        AppBuilder::new().with_file("foo.rs", None),
+        (
+            "let x = foo(#[b|]#ar);\n",
+            "<A-o>ggIzzzz<esc>%<A-i>",
+            "#[zzzzlet x = foo(bar);|]#\n",
+        ),
+    )
+    .await
 }

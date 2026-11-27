@@ -28,6 +28,14 @@ square brackets:
 The ordering of the nodes within the alternation (square brackets) is not
 taken into consideration.
 
+Angle brackets need care: `<` and `>` are usually comparison operators too, so
+capturing them globally would rainbow-colour every comparison. Capture them only
+within the generic node instead, which also marks that node as a scope:
+
+```tsq
+(type_arguments ["<" ">"] @rainbow.bracket) @rainbow.scope
+```
+
 > Note: Why are these nodes quoted? Most syntax highlights capture text
 > surrounded by parentheses. These are _named nodes_ and correspond to the
 > names of rules in the grammar. Brackets are usually written in tree-sitter
@@ -127,6 +135,6 @@ even though they aren't direct descendents of the `(element)` node.
 languages. It is only necessary when the node that increments the nesting level
 (changes rainbow color) is not the direct parent of the bracket node.
 
-[syntax highlighting queries]: https://tree-sitter.github.io/tree-sitter/syntax-highlighting#highlights
-[query syntax]: https://tree-sitter.github.io/tree-sitter/using-parsers#pattern-matching-with-queries
+[syntax highlighting queries]: https://tree-sitter.github.io/tree-sitter/3-syntax-highlighting.html#highlights
+[query syntax]: https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html
 [tsq grammar.js]: https://github.com/the-mikedavis/tree-sitter-tsq/blob/48b5e9f82ae0a4727201626f33a17f69f8e0ff86/grammar.js

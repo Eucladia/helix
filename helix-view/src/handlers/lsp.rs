@@ -6,7 +6,7 @@ use crate::editor::Action;
 use crate::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, LanguageServerInitialized,
 };
-use crate::{DocumentId, Editor};
+use crate::{DocumentId, Editor, ViewId};
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::Uri;
 use helix_event::register_hook;
@@ -40,6 +40,11 @@ pub struct PullAllDocumentsDiagnosticsEvent {
     pub language_servers: HashSet<LanguageServerId>,
 }
 
+pub struct CodeActionHintEvent {
+    pub document_id: DocumentId,
+    pub view_id: ViewId,
+}
+
 #[derive(Debug)]
 pub struct ApplyEditError {
     pub kind: ApplyEditErrorKind,
@@ -54,6 +59,23 @@ pub enum ApplyEditErrorKind {
     IoError(std::io::Error),
     // TODO: check edits before applying and propagate failure
     // InvalidEdit,
+}
+
+/// Whether a create/rename may replace its existing target. Without `overwrite` or
+/// `ignore_if_exists` it throws an error and aborts the edit.
+fn may_replace(
+    path: &std::path::Path,
+    overwrite: Option<bool>,
+    ignore_if_exists: Option<bool>,
+) -> Result<bool, ApplyEditErrorKind> {
+    match (overwrite, ignore_if_exists) {
+        (Some(true), _) => Ok(true),
+        (_, Some(true)) => Ok(false),
+        _ => {
+            let msg = format!("{} already exists", path.display());
+            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, msg).into())
+        }
+    }
 }
 
 impl From<std::io::Error> for ApplyEditErrorKind {
@@ -230,61 +252,55 @@ impl Editor {
         op: &lsp::ResourceOp,
     ) -> Result<(), ApplyEditErrorKind> {
         use lsp::ResourceOp;
-        use std::fs;
         // NOTE: If `Uri` gets another variant than `Path`, the below `expect`s
         // may no longer be valid.
         match op {
             ResourceOp::Create(op) => {
                 let uri = Uri::try_from(&op.uri)?;
                 let path = uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !path.exists() {
-                    // Create directory if it does not exist
-                    if let Some(dir) = path.parent() {
-                        if !dir.is_dir() {
-                            fs::create_dir_all(dir)?;
-                        }
-                    }
-
-                    fs::write(path, [])?;
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
+                let options = op.options.as_ref();
+                if !path.exists()
+                    || may_replace(
+                        path,
+                        options.and_then(|o| o.overwrite),
+                        options.and_then(|o| o.ignore_if_exists),
+                    )?
+                {
+                    self.create_path(path, false)?;
                 }
             }
             ResourceOp::Delete(op) => {
                 let uri = Uri::try_from(&op.uri)?;
                 let path = uri.as_path().expect("URIs are valid paths");
-                if path.is_dir() {
-                    let recursive = op
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.recursive)
-                        .unwrap_or(false);
-
-                    if recursive {
-                        fs::remove_dir_all(path)?
-                    } else {
-                        fs::remove_dir(path)?
-                    }
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
-                } else if path.is_file() {
-                    fs::remove_file(path)?;
+                let ignore_if_not_exists = op
+                    .options
+                    .as_ref()
+                    .is_some_and(|options| options.ignore_if_not_exists.unwrap_or(false));
+                if ignore_if_not_exists && !path.exists() {
+                    return Ok(());
                 }
+                let recursive = op
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.recursive)
+                    .unwrap_or(false);
+                self.delete_path(path, recursive)?;
             }
             ResourceOp::Rename(op) => {
                 let from_uri = Uri::try_from(&op.old_uri)?;
                 let from = from_uri.as_path().expect("URIs are valid paths");
                 let to_uri = Uri::try_from(&op.new_uri)?;
                 let to = to_uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !to.exists() {
+                let options = op.options.as_ref();
+                // A case-only rename on a case-insensitive filesystem
+                if !to.exists()
+                    || same_file::is_same_file(from, to).unwrap_or(false)
+                    || may_replace(
+                        to,
+                        options.and_then(|o| o.overwrite),
+                        options.and_then(|o| o.ignore_if_exists),
+                    )?
+                {
                     self.move_path(from, to)?;
                 }
             }

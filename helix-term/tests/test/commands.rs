@@ -6,6 +6,7 @@ mod insert;
 mod movement;
 mod reverse_selection_contents;
 mod rotate_selection_contents;
+mod workspace_edit;
 mod write;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -551,6 +552,132 @@ async fn test_insert_with_indent() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_open_below_at_block_end_stays_in_block() -> anyhow::Result<()> {
+    test((
+        indoc! { "\
+            def f():
+                #[y|]# = 1
+            z = 2
+            "
+        },
+        ":lang python<ret>ox<esc>",
+        indoc! { "\
+            def f():
+                y = 1
+                x#[
+            |]#z = 2
+            "
+        },
+    ))
+    .await?;
+
+    test((
+        indoc! { "\
+            def f():
+                #[y|]# = 1"
+        },
+        ":lang python<ret>ox<esc>",
+        indoc! { "\
+            def f():
+                y = 1
+                x#[
+            |]#"
+        },
+    ))
+    .await?;
+
+    // `@extend.prevent-once` after `return` still dedents (mid-file)
+    test((
+        indoc! { "\
+            def f():
+                #[r|]#eturn 1"
+        },
+        ":lang python<ret>ox<esc>",
+        indoc! { "\
+            def f():
+                return 1
+            x#[
+            |]#"
+        },
+    ))
+    .await?;
+
+    test((
+        indoc! { "\
+            a:
+              #[b|]#: 1"
+        },
+        ":lang yaml<ret>ox<esc>",
+        indoc! { "\
+            a:
+              b: 1
+              x#[
+            |]#"
+        },
+    ))
+    .await?;
+
+    // A node that ends at the cursor
+    test((
+        indoc! { "\
+            if x
+              #[p|]#uts \"a\"
+            end"
+        },
+        ":lang crystal<ret>ox<esc>",
+        indoc! { "\
+            if x
+              puts \"a\"
+              x#[
+            |]#end"
+        },
+    ))
+    .await?;
+
+    test((
+        "def f():\n    #[y|]# = 1  ",
+        ":lang python<ret>ox<esc>",
+        "def f():\n    y = 1  \n    x#[\n|]#",
+    ))
+    .await?;
+
+    // A trailing comment is part of the block before it, but a dedented one ends the block.
+    let mut config = test_config();
+    config.editor.continue_comments = false;
+    config.editor.indent_heuristic = helix_core::syntax::config::IndentationHeuristic::TreeSitter;
+    test_with_config(
+        AppBuilder::new().with_config(config.clone()),
+        (
+            "a:\n  b: 1\n#[#|]# c\nz: 2\n",
+            ":lang yaml<ret>ox<esc>",
+            "a:\n  b: 1\n# c\nx#[\n|]#z: 2\n",
+        ),
+    )
+    .await?;
+
+    // `@extend` must not stretch a node that closes on the cursor line.
+    test((
+        "#[f|]#oo := \"bar\"\nbaz := 1\n",
+        ":lang just<ret>ox<esc>",
+        "foo := \"bar\"\nx#[\n|]#baz := 1\n",
+    ))
+    .await?;
+
+    // trailing comment
+    test_with_config(
+        AppBuilder::new().with_config(config.clone()),
+        (
+            "#[i|]#f (x) // c\n    foo();\n",
+            ":lang c<ret>ox<esc>",
+            "if (x) // c\n    x#[\n|]#    foo();\n",
+        ),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_join_selections() -> anyhow::Result<()> {
     // normal join
     test((
@@ -723,6 +850,65 @@ async fn test_join_selections_comment() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_toggle_comments_inside_comment_injection() -> anyhow::Result<()> {
+    // A `//` line comment's text is injected as the `comment` language, which has no
+    // comment-tokens of its own. With the cursor inside the comment, toggling must
+    // resolve tokens from the enclosing language and un-comment the line,
+    // not fall back to the hardcoded default `#`.
+    test((
+        indoc! {"\
+            // #[a|]#bc
+        "},
+        ":lang rust<ret><C-c>",
+        indoc! {"\
+            #[a|]#bc
+        "},
+    ))
+    .await?;
+
+    // A `///` doc comment's text is injected as markdown (no line comment token of
+    // its own). Toggling must strip the whole `///` marker via Rust's tokens rather
+    // than insert a markdown `<!-- -->` inside or leave a stray `/`.
+    test((
+        indoc! {"\
+            /// #[a|]#bc
+        "},
+        ":lang rust<ret><C-c>",
+        indoc! {"\
+            #[a|]#bc
+        "},
+    ))
+    .await?;
+
+    // Likewise for the `//!` inner doc comment marker.
+    test((
+        indoc! {"\
+            //! #[a|]#bc
+        "},
+        ":lang rust<ret><C-c>",
+        indoc! {"\
+            #[a|]#bc
+        "},
+    ))
+    .await?;
+
+    // Commenting a normal code line still uses the top-level language's token
+    // (no injection layer at the cursor), no regression for the common case.
+    test((
+        indoc! {"\
+            #[l|]#et x = 5;
+        "},
+        ":lang rust<ret><C-c>",
+        indoc! {"\
+            // #[l|]#et x = 5;
+        "},
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_read_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let contents_to_read = "some contents";
@@ -863,6 +1049,47 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
             // #[|
             ]#
             "},
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn align_selections_with_varying_columns() -> anyhow::Result<()> {
+    test((
+        indoc! {r"
+            #[|]#I    I  II I
+            IIIIIIIII
+            IIIII
+            IIIIIIIII
+        "},
+        r"%sI<ret>&gg",
+        indoc! {r"
+            #[I|]#    I  II I
+            I    I  II IIIII
+            I    I  II I
+            I    I  II IIIII
+        "},
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reflow_selections_in_one_paragraph() -> anyhow::Result<()> {
+    test((
+        indoc! {"\
+            #[a|]# b c d e
+            f #(g|)# h
+        "},
+        ":reflow 5<ret>",
+        indoc! {"\
+            #[a|]# b c
+            d e f
+            #(g|)# h
+        "},
     ))
     .await?;
 
